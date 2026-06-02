@@ -1,18 +1,22 @@
-import os
 import random
 import sqlite3
 import string
 import threading
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Iterator
 
-from config import BACKUP_DIR
+from config import BACKUP_DIR, DATABASE_PATH, OWNER_ID
+
+
+db_lock = threading.RLock()
 
 
 class DatabaseManager:
     def __init__(self, database_path: str) -> None:
         self.database_path = database_path
-        self.db_lock = threading.RLock()
+        Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -21,26 +25,24 @@ class DatabaseManager:
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
-    def _write(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
-        with self.db_lock:
-            with self._connect() as conn:
-                try:
-                    result = operation(conn)
-                    conn.commit()
-                    return result
-                except Exception:
-                    conn.rollback()
-                    raise
-
-    def _read(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
-        with self._connect() as conn:
-            return operation(conn)
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        with db_lock:
+            conn = self._connect()
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     @staticmethod
     def _today() -> str:
@@ -48,21 +50,21 @@ class DatabaseManager:
 
     @staticmethod
     def _now() -> str:
-        return datetime.now().strftime("%Y/%m/%d %H:%M")
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def initialize(self) -> None:
-        def op(conn: sqlite3.Connection) -> None:
+    def init_database(self) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     first_name TEXT NOT NULL DEFAULT '',
-                    last_name TEXT NOT NULL DEFAULT '',
                     username TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    last_seen TEXT NOT NULL,
-                    is_blocked INTEGER NOT NULL DEFAULT 0
-                );
+                    joined_at TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                )
                 """
             )
 
@@ -70,25 +72,25 @@ class DatabaseManager:
                 """
                 CREATE TABLE IF NOT EXISTS admins (
                     user_id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    added_by INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
+                    first_name TEXT NOT NULL DEFAULT '',
+                    added_by INTEGER NOT NULL DEFAULT 0,
+                    added_at TEXT NOT NULL
+                )
                 """
             )
 
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS contents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT NOT NULL UNIQUE,
+                    code TEXT PRIMARY KEY,
                     content_type TEXT NOT NULL,
-                    file_id TEXT NOT NULL DEFAULT '',
-                    text TEXT NOT NULL DEFAULT '',
+                    file_id TEXT,
+                    text TEXT,
                     uploader_id INTEGER NOT NULL,
                     uploader_name TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
+                    uploaded_at TEXT NOT NULL,
+                    downloads INTEGER NOT NULL DEFAULT 0
+                )
                 """
             )
 
@@ -98,9 +100,10 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
+                    invite_link TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    added_at TEXT NOT NULL
+                )
                 """
             )
 
@@ -109,7 +112,7 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
-                );
+                )
                 """
             )
 
@@ -118,11 +121,10 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS downloads (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
-                    content_id INTEGER NOT NULL,
                     code TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (content_id) REFERENCES contents(id) ON DELETE CASCADE
-                );
+                    downloaded_at TEXT NOT NULL,
+                    FOREIGN KEY(code) REFERENCES contents(code) ON DELETE CASCADE
+                )
                 """
             )
 
@@ -134,193 +136,164 @@ class DatabaseManager:
                     downloads INTEGER NOT NULL DEFAULT 0,
                     uploads INTEGER NOT NULL DEFAULT 0,
                     successful_joins INTEGER NOT NULL DEFAULT 0,
-                    link_views INTEGER NOT NULL DEFAULT 0,
-                    broadcasts INTEGER NOT NULL DEFAULT 0
-                );
+                    link_views INTEGER NOT NULL DEFAULT 0
+                )
                 """
             )
 
+            now = self._now()
             conn.execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES('force_join_enabled', '0');"
+                """
+                INSERT OR IGNORE INTO admins (user_id, first_name, added_by, added_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (OWNER_ID, "مالک ربات", OWNER_ID, now),
             )
-            self._ensure_statistics_row(conn, self._today())
 
-        self._write(op)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO settings (key, value)
+                VALUES ('force_join_enabled', '0')
+                """
+            )
 
-    def _ensure_statistics_row(self, conn: sqlite3.Connection, date_text: str) -> None:
+            self._ensure_today_stats_in_tx(conn)
+
+    def _ensure_today_stats_in_tx(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             """
-            INSERT OR IGNORE INTO statistics(
-                stat_date,
-                new_users,
-                downloads,
-                uploads,
-                successful_joins,
-                link_views,
-                broadcasts
-            )
-            VALUES(?, 0, 0, 0, 0, 0, 0);
+            INSERT OR IGNORE INTO statistics
+            (stat_date, new_users, downloads, uploads, successful_joins, link_views)
+            VALUES (?, 0, 0, 0, 0, 0)
             """,
-            (date_text,),
+            (self._today(),),
         )
 
-    def _increment_stat(self, conn: sqlite3.Connection, field: str, amount: int = 1) -> None:
-        allowed = {
-            "new_users",
-            "downloads",
-            "uploads",
-            "successful_joins",
-            "link_views",
-            "broadcasts",
-        }
-        if field not in allowed:
-            raise ValueError("نام آمار معتبر نیست.")
+    def _increment_stat_in_tx(self, conn: sqlite3.Connection, column: str, amount: int = 1) -> None:
+        allowed = {"new_users", "downloads", "uploads", "successful_joins", "link_views"}
+        if column not in allowed:
+            raise ValueError("ستون آماری نامعتبر است.")
 
-        today = self._today()
-        self._ensure_statistics_row(conn, today)
+        self._ensure_today_stats_in_tx(conn)
         conn.execute(
-            f"UPDATE statistics SET {field} = {field} + ? WHERE stat_date = ?;",
-            (amount, today),
+            f"UPDATE statistics SET {column} = {column} + ? WHERE stat_date = ?",
+            (amount, self._today()),
         )
 
-    def register_user(
-        self,
-        user_id: int,
-        first_name: str,
-        last_name: str,
-        username: str,
-    ) -> bool:
-        def op(conn: sqlite3.Connection) -> bool:
-            now = self._now()
-            row = conn.execute(
-                "SELECT user_id FROM users WHERE user_id = ?;",
+    def register_user(self, user_id: int, first_name: str, username: str) -> bool:
+        now = self._now()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            existing = conn.execute(
+                "SELECT user_id FROM users WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
 
-            is_new = row is None
-
-            if is_new:
-                conn.execute(
-                    """
-                    INSERT INTO users(
-                        user_id,
-                        first_name,
-                        last_name,
-                        username,
-                        created_at,
-                        last_seen,
-                        is_blocked
-                    )
-                    VALUES(?, ?, ?, ?, ?, ?, 0);
-                    """,
-                    (user_id, first_name, last_name, username, now, now),
-                )
-                self._increment_stat(conn, "new_users", 1)
-            else:
+            if existing:
                 conn.execute(
                     """
                     UPDATE users
-                    SET first_name = ?,
-                        last_name = ?,
-                        username = ?,
-                        last_seen = ?,
-                        is_blocked = 0
-                    WHERE user_id = ?;
+                    SET first_name = ?, username = ?, last_seen = ?
+                    WHERE user_id = ?
                     """,
-                    (first_name, last_name, username, now, user_id),
+                    (first_name, username, now, user_id),
                 )
+                return False
 
-            return is_new
-
-        return bool(self._write(op))
-
-    def mark_user_blocked(self, user_id: int, blocked: bool) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute(
-                "UPDATE users SET is_blocked = ? WHERE user_id = ?;",
-                (1 if blocked else 0, user_id),
-            )
-
-        self._write(op)
-
-    def get_all_user_ids(self) -> list[int]:
-        def op(conn: sqlite3.Connection) -> list[int]:
-            rows = conn.execute(
-                "SELECT user_id FROM users WHERE is_blocked = 0 ORDER BY user_id ASC;"
-            ).fetchall()
-            return [int(row["user_id"]) for row in rows]
-
-        return self._read(op)
-
-    def add_admin(self, user_id: int, name: str, added_by: int) -> None:
-        def op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 """
-                INSERT INTO admins(user_id, name, added_by, created_at)
-                VALUES(?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    name = excluded.name,
-                    added_by = excluded.added_by;
+                INSERT INTO users (user_id, first_name, username, joined_at, last_seen)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (user_id, name, added_by, self._now()),
+                (user_id, first_name, username, now, now),
             )
+            self._increment_stat_in_tx(conn, "new_users", 1)
+            return True
 
-        self._write(op)
+    def get_user(self, user_id: int) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
-    def remove_admin(self, user_id: int) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute("DELETE FROM admins WHERE user_id = ?;", (user_id,))
+    def get_all_users(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY joined_at ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]
 
-        self._write(op)
+    def delete_user(self, user_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 
     def is_admin(self, user_id: int) -> bool:
-        def op(conn: sqlite3.Connection) -> bool:
+        with self.connection() as conn:
             row = conn.execute(
-                "SELECT user_id FROM admins WHERE user_id = ?;",
+                "SELECT user_id FROM admins WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
             return row is not None
 
-        return bool(self._read(op))
+    def add_admin(self, user_id: int, first_name: str, added_by: int) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO admins (user_id, first_name, added_by, added_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, first_name, added_by, self._now()),
+            )
+
+    def remove_admin(self, user_id: int) -> None:
+        if user_id == OWNER_ID:
+            return
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
 
     def get_admins(self) -> list[dict[str, Any]]:
-        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        with self.connection() as conn:
             rows = conn.execute(
-                "SELECT user_id, name, added_by, created_at FROM admins ORDER BY created_at ASC;"
+                "SELECT * FROM admins ORDER BY added_at ASC"
             ).fetchall()
             return [dict(row) for row in rows]
 
-        return self._read(op)
-
-    def _generate_code(self, length: int = 6) -> str:
-        chars = string.ascii_uppercase + string.digits
-        return "".join(random.choice(chars) for _ in range(length))
+    def create_code(self) -> str:
+        alphabet = string.ascii_uppercase + string.digits
+        while True:
+            code = "".join(random.choices(alphabet, k=6))
+            with self.connection() as conn:
+                row = conn.execute(
+                    "SELECT code FROM contents WHERE code = ?",
+                    (code,),
+                ).fetchone()
+                if row is None:
+                    return code
 
     def create_content(
         self,
         content_type: str,
-        file_id: str,
-        text: str,
+        file_id: str | None,
+        text: str | None,
         uploader_id: int,
         uploader_name: str,
     ) -> str:
-        def op(conn: sqlite3.Connection) -> str:
-            code = self._generate_code()
-            while conn.execute("SELECT id FROM contents WHERE code = ?;", (code,)).fetchone():
-                code = self._generate_code()
+        code = self.create_code()
 
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
-                INSERT INTO contents(
-                    code,
-                    content_type,
-                    file_id,
-                    text,
-                    uploader_id,
-                    uploader_name,
-                    created_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO contents
+                (code, content_type, file_id, text, uploader_id, uploader_name, uploaded_at, downloads)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     code,
@@ -332,191 +305,150 @@ class DatabaseManager:
                     self._now(),
                 ),
             )
-            self._increment_stat(conn, "uploads", 1)
-            return code
+            self._increment_stat_in_tx(conn, "uploads", 1)
 
-        return str(self._write(op))
+        return code
 
-    def get_content_by_code(self, code: str) -> dict[str, Any] | None:
-        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    def get_content(self, code: str) -> dict[str, Any] | None:
+        with self.connection() as conn:
             row = conn.execute(
-                """
-                SELECT
-                    id,
-                    code,
-                    content_type,
-                    file_id,
-                    text,
-                    uploader_id,
-                    uploader_name,
-                    created_at
-                FROM contents
-                WHERE code = ?;
-                """,
+                "SELECT * FROM contents WHERE code = ?",
                 (code,),
             ).fetchone()
             return dict(row) if row else None
 
-        return self._read(op)
-
-    def delete_content(self, content_id: int) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute("DELETE FROM contents WHERE id = ?;", (content_id,))
-
-        self._write(op)
-
     def get_contents(self) -> list[dict[str, Any]]:
-        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        with self.connection() as conn:
             rows = conn.execute(
-                """
-                SELECT
-                    id,
-                    code,
-                    content_type,
-                    file_id,
-                    text,
-                    uploader_id,
-                    uploader_name,
-                    created_at
-                FROM contents
-                ORDER BY id DESC;
-                """
+                "SELECT * FROM contents ORDER BY uploaded_at DESC"
             ).fetchall()
             return [dict(row) for row in rows]
 
-        return self._read(op)
+    def delete_content(self, code: str) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM contents WHERE code = ?", (code,))
 
-    def add_channel(self, chat_id: str, title: str, url: str) -> None:
-        def op(conn: sqlite3.Connection) -> None:
+    def record_download(self, user_id: int, code: str) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
-                INSERT INTO channels(chat_id, title, url, created_at)
-                VALUES(?, ?, ?, ?)
+                INSERT INTO downloads (user_id, code, downloaded_at)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, code, self._now()),
+            )
+            conn.execute(
+                """
+                UPDATE contents
+                SET downloads = downloads + 1
+                WHERE code = ?
+                """,
+                (code,),
+            )
+            self._increment_stat_in_tx(conn, "downloads", 1)
+
+    def get_downloads(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM downloads ORDER BY downloaded_at DESC"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def add_channel(self, chat_id: str, title: str, invite_link: str) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO channels (chat_id, title, invite_link, active, added_at)
+                VALUES (?, ?, ?, 1, ?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     title = excluded.title,
-                    url = excluded.url;
+                    invite_link = excluded.invite_link,
+                    active = 1
                 """,
-                (chat_id, title, url, self._now()),
+                (chat_id, title, invite_link, self._now()),
             )
 
-        self._write(op)
-
     def remove_channel(self, channel_id: int) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute("DELETE FROM channels WHERE id = ?;", (channel_id,))
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
 
-        self._write(op)
-
-    def get_channel_by_id(self, channel_id: int) -> dict[str, Any] | None:
-        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
-            row = conn.execute(
-                "SELECT id, chat_id, title, url, created_at FROM channels WHERE id = ?;",
-                (channel_id,),
-            ).fetchone()
-            return dict(row) if row else None
-
-        return self._read(op)
+    def set_channel_active(self, channel_id: int, active: bool) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE channels SET active = ? WHERE id = ?",
+                (1 if active else 0, channel_id),
+            )
 
     def get_channels(self) -> list[dict[str, Any]]:
-        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        with self.connection() as conn:
             rows = conn.execute(
-                "SELECT id, chat_id, title, url, created_at FROM channels ORDER BY id ASC;"
+                "SELECT * FROM channels ORDER BY id ASC"
             ).fetchall()
             return [dict(row) for row in rows]
 
-        return self._read(op)
-
-    def set_force_join_enabled(self, enabled: bool) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute(
-                """
-                INSERT INTO settings(key, value)
-                VALUES('force_join_enabled', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-                """,
-                ("1" if enabled else "0",),
-            )
-
-        self._write(op)
-
-    def get_force_join_enabled(self) -> bool:
-        def op(conn: sqlite3.Connection) -> bool:
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key = 'force_join_enabled';"
-            ).fetchone()
-            return bool(row and row["value"] == "1")
-
-        return bool(self._read(op))
-
-    def set_setting(self, key: str, value: str) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute(
-                """
-                INSERT INTO settings(key, value)
-                VALUES(?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-                """,
-                (key, value),
-            )
-
-        self._write(op)
+    def get_active_channels(self) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM channels WHERE active = 1 ORDER BY id ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def get_setting(self, key: str, default: str = "") -> str:
-        def op(conn: sqlite3.Connection) -> str:
+        with self.connection() as conn:
             row = conn.execute(
-                "SELECT value FROM settings WHERE key = ?;",
+                "SELECT value FROM settings WHERE key = ?",
                 (key,),
             ).fetchone()
             return str(row["value"]) if row else default
 
-        return self._read(op)
-
-    def record_download(self, user_id: int, content_id: int, code: str) -> None:
-        def op(conn: sqlite3.Connection) -> None:
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
-                INSERT INTO downloads(user_id, content_id, code, created_at)
-                VALUES(?, ?, ?, ?);
+                INSERT INTO settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
-                (user_id, content_id, code, self._now()),
+                (key, value),
             )
-            self._increment_stat(conn, "downloads", 1)
 
-        self._write(op)
+    def is_force_join_enabled(self) -> bool:
+        return self.get_setting("force_join_enabled", "0") == "1"
 
-    def increment_link_view(self) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            self._increment_stat(conn, "link_views", 1)
+    def set_force_join_enabled(self, enabled: bool) -> None:
+        self.set_setting("force_join_enabled", "1" if enabled else "0")
 
-        self._write(op)
+    def record_link_view(self) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._increment_stat_in_tx(conn, "link_views", 1)
 
-    def increment_successful_join(self) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            self._increment_stat(conn, "successful_joins", 1)
-
-        self._write(op)
-
-    def increment_broadcast(self) -> None:
-        def op(conn: sqlite3.Connection) -> None:
-            self._increment_stat(conn, "broadcasts", 1)
-
-        self._write(op)
+    def record_successful_join(self) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._increment_stat_in_tx(conn, "successful_joins", 1)
 
     def get_statistics_summary(self) -> dict[str, int]:
-        def op(conn: sqlite3.Connection) -> dict[str, int]:
-            today = self._today()
-            self._ensure_statistics_row(conn, today)
+        today = self._today()
+        with self.connection() as conn:
+            self._ensure_today_stats_in_tx(conn)
+
+            total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+            total_uploads = conn.execute("SELECT COUNT(*) AS c FROM contents").fetchone()["c"]
+            total_downloads = conn.execute("SELECT COUNT(*) AS c FROM downloads").fetchone()["c"]
+            total_admins = conn.execute("SELECT COUNT(*) AS c FROM admins").fetchone()["c"]
+            total_channels = conn.execute("SELECT COUNT(*) AS c FROM channels").fetchone()["c"]
 
             daily = conn.execute(
-                "SELECT * FROM statistics WHERE stat_date = ?;",
+                "SELECT * FROM statistics WHERE stat_date = ?",
                 (today,),
             ).fetchone()
-
-            total_users = conn.execute("SELECT COUNT(*) AS c FROM users;").fetchone()["c"]
-            total_uploads = conn.execute("SELECT COUNT(*) AS c FROM contents;").fetchone()["c"]
-            total_downloads = conn.execute("SELECT COUNT(*) AS c FROM downloads;").fetchone()["c"]
-            total_admins = conn.execute("SELECT COUNT(*) AS c FROM admins;").fetchone()["c"]
-            total_channels = conn.execute("SELECT COUNT(*) AS c FROM channels;").fetchone()["c"]
 
             return {
                 "total_users": int(total_users),
@@ -524,64 +456,65 @@ class DatabaseManager:
                 "total_downloads": int(total_downloads),
                 "total_admins": int(total_admins),
                 "total_channels": int(total_channels),
-                "daily_users": int(daily["new_users"]),
-                "daily_downloads": int(daily["downloads"]),
+                "daily_users": int(daily["new_users"] if daily else 0),
+                "daily_downloads": int(daily["downloads"] if daily else 0),
             }
 
-        return self._read(op)
-
     def get_daily_report(self) -> dict[str, int]:
-        def op(conn: sqlite3.Connection) -> dict[str, int]:
-            today = self._today()
-            self._ensure_statistics_row(conn, today)
+        today = self._today()
+        with self.connection() as conn:
+            self._ensure_today_stats_in_tx(conn)
 
-            row = conn.execute(
-                "SELECT * FROM statistics WHERE stat_date = ?;",
+            daily = conn.execute(
+                "SELECT * FROM statistics WHERE stat_date = ?",
                 (today,),
             ).fetchone()
 
-            total_users = conn.execute("SELECT COUNT(*) AS c FROM users;").fetchone()["c"]
+            total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
 
             return {
-                "new_users": int(row["new_users"]),
+                "new_users": int(daily["new_users"] if daily else 0),
                 "total_users": int(total_users),
-                "downloads": int(row["downloads"]),
-                "uploads": int(row["uploads"]),
-                "successful_joins": int(row["successful_joins"]),
-                "link_views": int(row["link_views"]),
-                "broadcasts": int(row["broadcasts"]),
+                "downloads": int(daily["downloads"] if daily else 0),
+                "uploads": int(daily["uploads"] if daily else 0),
+                "successful_joins": int(daily["successful_joins"] if daily else 0),
+                "link_views": int(daily["link_views"] if daily else 0),
             }
 
-        return self._read(op)
-
-    def get_downloads_by_user(self, user_id: int) -> list[dict[str, Any]]:
-        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-            rows = conn.execute(
+    def reset_statistics_for_date(self, stat_date: str) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
                 """
-                SELECT id, user_id, content_id, code, created_at
-                FROM downloads
-                WHERE user_id = ?
-                ORDER BY id DESC;
+                INSERT OR REPLACE INTO statistics
+                (stat_date, new_users, downloads, uploads, successful_joins, link_views)
+                VALUES (?, 0, 0, 0, 0, 0)
                 """,
-                (user_id,),
-            ).fetchall()
-            return [dict(row) for row in rows]
-
-        return self._read(op)
+                (stat_date,),
+            )
 
     def create_backup(self) -> str:
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        filename = f"backup_{datetime.now().strftime('%Y_%m_%d')}.db"
-        backup_path = os.path.join(BACKUP_DIR, filename)
+        backup_dir = Path(BACKUP_DIR)
+        backup_dir.mkdir(parents=True, exist_ok=True)
 
-        with self.db_lock:
-            with self._connect() as source:
-                with sqlite3.connect(
-                    backup_path,
-                    timeout=30,
-                    check_same_thread=False,
-                ) as destination:
-                    source.backup(destination)
-                    destination.commit()
+        filename = f"backup_{datetime.now().strftime('%Y_%m_%d')}.db"
+        backup_path = str(backup_dir / filename)
+
+        with db_lock:
+            source = self._connect()
+            destination = sqlite3.connect(
+                backup_path,
+                timeout=30,
+                check_same_thread=False,
+            )
+            try:
+                source.backup(destination)
+                destination.commit()
+            finally:
+                destination.close()
+                source.close()
 
         return backup_path
+
+
+db = DatabaseManager(DATABASE_PATH)
