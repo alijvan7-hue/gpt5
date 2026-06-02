@@ -289,17 +289,9 @@ async def deliver_content(bot: Bot, chat_id: int, user_id: int, code: str) -> No
 
     db.record_download(user_id=user_id, code=code)
 
-    info_message = await bot.send_message(
-        chat_id,
-        "آپلود کننده:\n"
-        f"نام ادمین: {content['uploader_name']}\n"
-        f"شناسه ادمین: {content['uploader_id']}\n"
-        f"تاریخ آپلود: {content['uploaded_at']}",
-    )
-
     countdown_message = await bot.send_message(
         chat_id,
-        "⏳ این محتوا تا ۶۰ ثانیه دیگر حذف می‌شود.",
+        "⏳ این محتوا تا ۶۰ ثانیه دیگر حذف می‌شود\nلطفاً محتوا را در جایی ذخیره کنید",
     )
 
     ids_to_delete = []
